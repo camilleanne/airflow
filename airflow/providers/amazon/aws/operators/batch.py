@@ -25,16 +25,9 @@ An Airflow operator for AWS Batch services
 """
 from __future__ import annotations
 
-import sys
 from typing import TYPE_CHECKING, Any, Sequence
 
-from airflow.providers.amazon.aws.utils import trim_none_values
-
-if sys.version_info >= (3, 8):
-    from functools import cached_property
-else:
-    from cached_property import cached_property
-
+from airflow.compat.functools import cached_property
 from airflow.exceptions import AirflowException
 from airflow.models import BaseOperator
 from airflow.providers.amazon.aws.hooks.batch_client import BatchClientHook
@@ -44,6 +37,7 @@ from airflow.providers.amazon.aws.links.batch import (
     BatchJobQueueLink,
 )
 from airflow.providers.amazon.aws.links.logs import CloudWatchEventsLink
+from airflow.providers.amazon.aws.utils import trim_none_values
 
 if TYPE_CHECKING:
     from airflow.utils.context import Context
@@ -58,35 +52,29 @@ class BatchOperator(BaseOperator):
         :ref:`howto/operator:BatchOperator`
 
     :param job_name: the name for the job that will run on AWS Batch (templated)
-
     :param job_definition: the job definition name on AWS Batch
-
     :param job_queue: the queue name on AWS Batch
 
-    :param overrides: the `containerOverrides` parameter for boto3 (templated)
+    :param overrides: DEPRECATED, use container_overrides instead with the same value.
+
+    :param container_overrides: the `containerOverrides` parameter for boto3 (templated)
+
+    :param node_overrides: the `nodeOverrides` parameter for boto3 (templated)
 
     :param array_properties: the `arrayProperties` parameter for boto3
-
     :param parameters: the `parameters` for boto3 (templated)
-
     :param job_id: the job ID, usually unknown (None) until the
         submit_job operation gets the jobId defined by AWS Batch
-
     :param waiters: an :py:class:`.BatchWaiters` object (see note below);
         if None, polling is used with max_retries and status_retries.
-
     :param max_retries: exponential back-off retries, 4200 = 48 hours;
         polling is only used when waiters is None
-
     :param status_retries: number of HTTP retries to get job status, 10;
         polling is only used when waiters is None
-
     :param aws_conn_id: connection id of AWS credentials / region name. If None,
         credential boto3 strategy will be used.
-
     :param region_name: region name to use in AWS Hook.
         Override the region_name in connection (if provided)
-
     :param tags: collection of tags to apply to the AWS Batch job submission
         if None, no tags are submitted
 
@@ -106,14 +94,19 @@ class BatchOperator(BaseOperator):
         "job_name",
         "job_definition",
         "job_queue",
-        "overrides",
+        "container_overrides",
         "array_properties",
+        "node_overrides",
         "parameters",
         "waiters",
         "tags",
         "wait_for_completion",
     )
-    template_fields_renderers = {"overrides": "json", "parameters": "json"}
+    template_fields_renderers = {
+        "container_overrides": "json",
+        "parameters": "json",
+        "node_overrides": "json",
+    }
 
     @property
     def operator_extra_links(self):
@@ -132,8 +125,10 @@ class BatchOperator(BaseOperator):
         job_name: str,
         job_definition: str,
         job_queue: str,
-        overrides: dict,
+        overrides: dict | None = None,  # deprecated
+        container_overrides: dict | None = None,
         array_properties: dict | None = None,
+        node_overrides: dict | None = None,
         parameters: dict | None = None,
         job_id: str | None = None,
         waiters: Any | None = None,
@@ -151,8 +146,23 @@ class BatchOperator(BaseOperator):
         self.job_name = job_name
         self.job_definition = job_definition
         self.job_queue = job_queue
-        self.overrides = overrides or {}
-        self.array_properties = array_properties or {}
+
+        if overrides:
+            self.container_overrides = overrides
+            warnings.warn(
+                f"Parameter `overrides` is deprecated, Please use `container_overrides` instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if container_overrides:
+                raise AirflowException(
+                    "If providing `container_overrides`, then old parameter 'overrides' should be removed."
+                )
+        else:
+            self.container_overrides = container_overrides
+
+        self.node_overrides = node_overrides
+        self.array_properties = array_properties
         self.parameters = parameters or {}
         self.waiters = waiters
         self.tags = tags or {}
@@ -192,18 +202,27 @@ class BatchOperator(BaseOperator):
             self.job_definition,
             self.job_queue,
         )
-        self.log.info("AWS Batch job - container overrides: %s", self.overrides)
+
+        if self.container_overrides:
+            self.log.info("AWS Batch job - container overrides: %s", self.container_overrides)
+        if self.array_properties:
+            self.log.info("AWS Batch job - array properties: %s", self.array_properties)
+        if self.node_overrides:
+            self.log.info("AWS Batch job - node properties: %s", self.node_overrides)
+
+        args = {
+            "jobName": self.job_name,
+            "jobQueue": self.job_queue,
+            "jobDefinition": self.job_definition,
+            "arrayProperties": self.array_properties,
+            "parameters": self.parameters,
+            "tags": self.tags,
+            "containerOverrides": self.container_overrides,
+            "nodeOverrides": self.node_overrides,
+        }
 
         try:
-            response = self.hook.client.submit_job(
-                jobName=self.job_name,
-                jobQueue=self.job_queue,
-                jobDefinition=self.job_definition,
-                arrayProperties=self.array_properties,
-                parameters=self.parameters,
-                containerOverrides=self.overrides,
-                tags=self.tags,
-            )
+            response = self.hook.client.submit_job(**trim_none_values(args))
         except Exception as e:
             self.log.error(
                 "AWS Batch job failed submission - job definition: %s - on queue %s",
